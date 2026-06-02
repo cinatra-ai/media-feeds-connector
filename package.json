@@ -16,6 +16,11 @@
   "peerDependencies": {
     "@cinatra-ai/sdk-extensions": "*"
   },
+  "peerDependenciesMeta": {
+    "@cinatra-ai/sdk-extensions": {
+      "optional": true
+    }
+  },
   "cinatra": {
     "apiVersion": "cinatra.ai/v1",
     "kind": "connector",
