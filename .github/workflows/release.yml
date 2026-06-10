@@ -26,5 +26,7 @@ jobs:
       contents: read
       id-token: write       # build-provenance attestation
       attestations: write
-    uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@main
+    # cinatra-ai/.github ships no version tags yet; pinned to main HEAD
+    # (020b09b, 2026-06-10). The `-main.<sha>` comment suffix marks an untagged branch pin.
+    uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@020b09b7a15cb96a434db489f2a102ce26ff45d7 # v0.0.0-main.020b09b
     secrets: inherit
