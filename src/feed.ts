@@ -13,6 +13,7 @@
 
 import { load } from "cheerio";
 import { isIP } from "node:net";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { MediaFeedError } from "./errors";
 
 // Emit `mediaUrl` directly from the primitive instead of asking the LLM to
@@ -70,6 +71,121 @@ function isPrivateIpv4(ip: string): boolean {
   return false;
 }
 
+// Expand a (possibly compressed, possibly dotted-suffixed) IPv6 string into
+// its 8 numeric hextets. Returns null if it cannot be parsed as 8 groups —
+// callers must fail closed on null.
+function expandIpv6Hextets(lower: string): number[] | null {
+  // Convert a trailing dotted-quad (::ffff:1.2.3.4) into two hex hextets so
+  // the whole address is uniform hex before splitting.
+  let work = lower;
+  const dotted = work.match(/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (dotted) {
+    const o = dotted.slice(1).map((d) => Number(d));
+    if (o.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null;
+    const hi = ((o[0] as number) << 8) | (o[1] as number);
+    const lo = ((o[2] as number) << 8) | (o[3] as number);
+    work =
+      work.slice(0, dotted.index) +
+      hi.toString(16) +
+      ":" +
+      lo.toString(16);
+  }
+
+  const halves = work.split("::");
+  if (halves.length > 2) return null;
+  const parsePart = (p: string): number[] | null => {
+    if (p === "") return [];
+    const groups = p.split(":");
+    const out: number[] = [];
+    for (const g of groups) {
+      if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+      out.push(parseInt(g, 16));
+    }
+    return out;
+  };
+  const head = parsePart(halves[0] as string);
+  if (head === null) return null;
+  if (halves.length === 1) {
+    return head.length === 8 ? head : null;
+  }
+  const tail = parsePart(halves[1] as string);
+  if (tail === null) return null;
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0) return null;
+  return [...head, ...Array(fill).fill(0), ...tail];
+}
+
+// If `lower` is an IPv4-mapped (::ffff:0:0/96) or IPv4-compatible (::/96, but
+// not :: or ::1 themselves) address, return the embedded IPv4 in dotted form;
+// otherwise null.
+function extractEmbeddedIpv4(lower: string): string | null {
+  const h = expandIpv6Hextets(lower);
+  if (h === null) return null;
+  const allZeroPrefix6 = h.slice(0, 6).every((x) => x === 0);
+  const v4Mapped = h[4] === 0 && h[5] === 0xffff && h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0;
+  const v4Compat = allZeroPrefix6 && !(h[6] === 0 && h[7] === 0) && !(h[6] === 0 && h[7] === 1);
+  if (!v4Mapped && !v4Compat) return null;
+  const a = ((h[6] as number) >> 8) & 0xff;
+  const b = (h[6] as number) & 0xff;
+  const c = ((h[7] as number) >> 8) & 0xff;
+  const d = (h[7] as number) & 0xff;
+  return `${a}.${b}.${c}.${d}`;
+}
+
+// Block IPv6 addresses that are loopback, unspecified, ULA, link-local,
+// multicast, or IPv4-mapped onto an unsafe IPv4. `addr` must be a canonical
+// IPv6 string (from URL.hostname-stripped literals or dns.lookup output);
+// we normalize through net's family detection rather than trusting prefixes.
+function isPrivateIpv6(addr: string): boolean {
+  if (isIP(addr) !== 6) return true; // not a valid v6 literal → fail closed
+  const lower = addr.toLowerCase();
+
+  // Classify loopback (::1) and unspecified (::) from the EXPANDED hextets, not
+  // a string match: a non-canonical equivalent (`0:0:0:0:0:0:0:1`, `0::1`,
+  // `::0.0.0.1`) is still loopback and must be blocked. A security predicate
+  // must not depend on URL/DNS upstream canonicalization it does not control —
+  // `dns.lookup` output is not guaranteed canonical. Fail closed if we cannot
+  // expand the address.
+  const hextets = expandIpv6Hextets(lower);
+  if (hextets === null) return true;
+  const allZero = hextets.every((x) => x === 0);
+  if (allZero) return true; // :: (unspecified)
+  if (hextets.slice(0, 7).every((x) => x === 0) && hextets[7] === 1) return true; // ::1 (loopback)
+
+  // IPv4-mapped (::ffff:a.b.c.d / ::ffff:HHHH:HHHH) and the deprecated
+  // IPv4-compatible (::a.b.c.d) forms embed an IPv4 address — extract the
+  // embedded v4 and apply the v4 blocklist. The embedded address can appear
+  // in EITHER dotted-quad form OR hex-hextet form (e.g. ::ffff:a9fe:a9fe is
+  // 169.254.169.254), so we must handle both — a trailing-dotted-quad regex
+  // alone is bypassable. We expand the address fully, then if it lies in the
+  // v4-mapped (::ffff:0:0/96) or v4-compatible (::/96) space, rebuild the
+  // dotted IPv4 from the final 32 bits.
+  const embeddedV4 = extractEmbeddedIpv4(lower);
+  if (embeddedV4 !== null) {
+    return isPrivateIpv4(embeddedV4);
+  }
+
+  const firstHextet = lower.split(":")[0] ?? "";
+  const head = parseInt(firstHextet || "0", 16);
+  if (Number.isNaN(head)) return true; // fail closed
+  // fc00::/7  (Unique Local Addresses) → first 7 bits are 1111 110
+  if ((head & 0xfe00) === 0xfc00) return true;
+  // fe80::/10 (link-local) → first 10 bits are 1111 1110 10
+  if ((head & 0xffc0) === 0xfe80) return true;
+  // ff00::/8  (multicast)
+  if ((head & 0xff00) === 0xff00) return true;
+  return false;
+}
+
+// Classify a literal IP string (already bracket-stripped). Returns true when
+// the address is safe to connect to. Fail closed on anything unrecognized.
+function isSafeIpLiteral(ip: string): boolean {
+  const family = isIP(ip);
+  if (family === 4) return !isPrivateIpv4(ip);
+  if (family === 6) return !isPrivateIpv6(ip);
+  return false;
+}
+
 function stripBrackets(host: string): string {
   // Node's URL.hostname returns "[::1]" (WITH brackets) for IPv6 literals,
   // and isIP("[::1]") returns 0 — bracket strip is mandatory before isIP.
@@ -87,6 +203,47 @@ function isSafeHost(host: string): boolean {
   if (family === 4) return !isPrivateIpv4(stripped);
   if (family === 6) return false; // conservative — block all IPv6 literals
   return true;
+}
+
+// Resolve a DNS hostname and assert EVERY resolved address is safe before any
+// socket is opened. This closes the gap where isSafeHost() returned true for
+// any DNS name regardless of where it pointed (e.g. a name resolving to
+// 169.254.169.254 / 10.x / fe80::). Fail closed on resolution failure, zero
+// answers, or ANY unsafe answer (mixed safe/unsafe → reject).
+//
+// Residual: a narrow DNS-rebinding TOCTOU remains between this lookup and the
+// lookup Node's global fetch performs when it opens the socket — fully closing
+// it requires a transport/dispatcher connect hook (undici), which is
+// intentionally out of scope here (no new dependency). For a Medium-severity
+// SSRF this resolve-and-validate control removes the primary exposure.
+async function assertHostResolvesSafe(host: string): Promise<void> {
+  const stripped = stripBrackets(host);
+  // IP literals were already validated by isSafeHost; no DNS needed.
+  if (isIP(stripped) !== 0) return;
+
+  let addresses: Array<{ address: string }>;
+  try {
+    addresses = await dnsLookup(stripped, { all: true, verbatim: true });
+  } catch {
+    throw new MediaFeedError(
+      "MEDIA_FEED_PODCAST_INVALID_URL",
+      `Hostname ${host} could not be resolved.`,
+    );
+  }
+  if (addresses.length === 0) {
+    throw new MediaFeedError(
+      "MEDIA_FEED_PODCAST_INVALID_URL",
+      `Hostname ${host} resolved to no addresses.`,
+    );
+  }
+  for (const { address } of addresses) {
+    if (!isSafeIpLiteral(address)) {
+      throw new MediaFeedError(
+        "MEDIA_FEED_PODCAST_INVALID_URL",
+        `Hostname ${host} resolves to a blocked address.`,
+      );
+    }
+  }
 }
 
 function ensureSafeUrl(rawUrl: string): URL {
@@ -111,6 +268,15 @@ function ensureSafeUrl(rawUrl: string): URL {
       `Hostname ${parsed.hostname} is blocked.`,
     );
   }
+  return parsed;
+}
+
+// String-level fast-fail (ensureSafeUrl) PLUS DNS resolution + per-address
+// validation. This is the guard that must run before every actual fetch and
+// before following every redirect hop.
+async function ensureSafeUrlResolved(rawUrl: string): Promise<URL> {
+  const parsed = ensureSafeUrl(rawUrl);
+  await assertHostResolvesSafe(parsed.hostname);
   return parsed;
 }
 
@@ -145,7 +311,7 @@ async function fetchText(url: string): Promise<string> {
   // default; the safe pattern is `redirect: "manual"` with per-hop
   // validation. Cap byte count to FETCH_MAX_BYTES and timeout via
   // AbortController.
-  let current = ensureSafeUrl(url).toString();
+  let current = (await ensureSafeUrlResolved(url)).toString();
   for (let hop = 0; hop < 4; hop += 1) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
@@ -172,7 +338,9 @@ async function fetchText(url: string): Promise<string> {
           `Redirect from ${current} had no Location header.`,
         );
       }
-      current = ensureSafeUrl(new URL(location, current).toString()).toString();
+      current = (
+        await ensureSafeUrlResolved(new URL(location, current).toString())
+      ).toString();
       try {
         await response.body?.cancel();
       } catch {

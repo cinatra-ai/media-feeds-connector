@@ -1,5 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// DNS resolution is mocked so feed discovery never touches the network and so
+// SSRF tests can pin exactly which IP a hostname "resolves" to. By default
+// every hostname resolves to a public address; individual SSRF tests override
+// the resolver to return private/link-local/metadata addresses.
+const dnsLookupMock =
+  vi.fn<(host: string, options?: unknown) => Promise<Array<{ address: string; family: number }>>>(
+    async () => [{ address: "93.184.216.34", family: 4 }],
+  );
+vi.mock("node:dns/promises", () => ({
+  lookup: (host: string, options?: unknown) => dnsLookupMock(host, options),
+}));
+
 import { scrapePodcastEpisodes } from "../feed";
 
 const realFetch = globalThis.fetch;
@@ -7,6 +19,8 @@ const fetchMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  dnsLookupMock.mockReset();
+  dnsLookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
   globalThis.fetch = fetchMock as unknown as typeof fetch;
 });
 
@@ -68,6 +82,121 @@ describe("scrapePodcastEpisodes — SSRF guards (bracket-stripping fix)", () => 
       code: "MEDIA_FEED_PODCAST_INVALID_URL",
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("scrapePodcastEpisodes — SSRF guards (DNS resolution)", () => {
+  function redirect(location: string): Response {
+    return new Response(null, { status: 302, headers: { location } });
+  }
+
+  it.each([
+    ["10.0.0.5", 4],
+    ["169.254.169.254", 4],
+    ["192.168.1.10", 4],
+    ["127.0.0.1", 4],
+  ])("rejects hostname resolving to private IPv4 %s", async (address, family) => {
+    dnsLookupMock.mockResolvedValue([{ address, family }]);
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://evil.example.com/show" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["fe80::1", 6],
+    ["fc00::1", 6],
+    ["::1", 6],
+    ["::ffff:169.254.169.254", 6],
+    ["::ffff:10.0.0.1", 6],
+    ["ff02::1", 6],
+    // IPv4-mapped in HEX-hextet form (must not bypass the dotted-quad path):
+    // ::ffff:a9fe:a9fe == 169.254.169.254, ::ffff:0a00:1 == 10.0.0.1.
+    ["::ffff:a9fe:a9fe", 6],
+    ["::ffff:0a00:0001", 6],
+    ["::ffff:7f00:1", 6],
+    // IPv4-compatible (deprecated) hex form: ::a9fe:a9fe == 169.254.169.254.
+    ["::a9fe:a9fe", 6],
+  ])("rejects hostname resolving to private IPv6 %s", async (address, family) => {
+    dnsLookupMock.mockResolvedValue([{ address, family }]);
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://evil.example.com/show" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    // Non-canonical loopback/unspecified equivalents: a security predicate must
+    // not rely on URL/DNS canonicalization. dns.lookup output is NOT guaranteed
+    // canonical, so a resolver answer like `0:0:0:0:0:0:0:1` (== ::1) or
+    // `::0.0.0.1` (also == ::1) must still be classified loopback and blocked.
+    ["0:0:0:0:0:0:0:1", 6],
+    ["0:0:0:0:0:0:0:0", 6],
+    ["0::1", 6],
+    ["::0.0.0.1", 6],
+    ["::0.0.0.0", 6],
+  ])("rejects hostname resolving to non-canonical loopback/unspecified IPv6 %s", async (address, family) => {
+    dnsLookupMock.mockResolvedValue([{ address, family }]);
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://evil.example.com/show" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects when ANY of multiple resolved addresses is unsafe (mixed)", async () => {
+    dnsLookupMock.mockResolvedValue([
+      { address: "93.184.216.34", family: 4 },
+      { address: "169.254.169.254", family: 4 },
+    ]);
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://evil.example.com/show" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects when DNS resolution fails (fail closed)", async () => {
+    dnsLookupMock.mockRejectedValue(new Error("ENOTFOUND"));
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://nx.example.com/show" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects when DNS resolves to zero addresses (fail closed)", async () => {
+    dnsLookupMock.mockResolvedValue([]);
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://empty.example.com/show" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a 302 redirect to a host resolving to a private IP", async () => {
+    // Seed host resolves public; redirect target host resolves to metadata IP.
+    dnsLookupMock.mockImplementation(async (host: string) => {
+      if (host === "internal.evil.example.com") {
+        return [{ address: "169.254.169.254", family: 4 }];
+      }
+      return [{ address: "93.184.216.34", family: 4 }];
+    });
+    fetchMock.mockResolvedValueOnce(
+      redirect("https://internal.evil.example.com/computeMetadata/v1/"),
+    );
+    await expect(
+      scrapePodcastEpisodes({ websiteUrl: "https://safe.example.com/feed.xml" }),
+    ).rejects.toMatchObject({ code: "MEDIA_FEED_PODCAST_INVALID_URL" });
+    // The seed fetch happened (1 call) but the redirect target was never fetched.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows a hostname that resolves to a public IP", async () => {
+    dnsLookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
+    fetchMock.mockResolvedValueOnce(okText(SAMPLE_RSS, "application/rss+xml"));
+    const result = await scrapePodcastEpisodes({
+      websiteUrl: "https://example.com/feed.xml",
+      filterMode: "latest",
+      latestCount: 10,
+    });
+    expect(result.podcastTitle).toBe("The Test Podcast");
   });
 });
 
