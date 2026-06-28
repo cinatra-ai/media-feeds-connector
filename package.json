@@ -1,6 +1,6 @@
 {
   "name": "@cinatra-ai/media-feeds-connector",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "Apache-2.0",
   "type": "module",
   "files": [
@@ -36,6 +36,10 @@
   "cinatra": {
     "apiVersion": "cinatra.ai/v1",
     "kind": "connector",
+    "vendor": {
+      "key": "cinatra-ai",
+      "name": "Cinatra"
+    },
     "serverEntry": "./register",
     "requestedHostPorts": [
       "capabilities"
