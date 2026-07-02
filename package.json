@@ -46,6 +46,7 @@
     "requestedHostPorts": [
       "capabilities"
     ],
-    "dependencies": []
+    "dependencies": [],
+    "consumes": []
   }
 }
