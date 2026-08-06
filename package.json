@@ -38,6 +38,7 @@
     "apiVersion": "cinatra.ai/v1",
     "kind": "connector",
     "displayName": "Media Feeds",
+    "logo": "./cinatra/logo.svg",
     "sdkAbiRange": "^2",
     "vendor": {
       "key": "cinatra-ai",
